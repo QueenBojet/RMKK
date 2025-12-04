@@ -1,0 +1,309 @@
+# ==================== 数据库配置 ====================
+database:
+  host: "localhost"
+  port: 8086
+  database: "industrial_data"
+  username: ""
+  password: ""
+  timeout: 30
+  timezone: "Asia/Shanghai"
+
+# ==================== Modbus配置 ====================
+modbus:
+  server:
+    host: "192.168.0.145"
+    port: 502
+  collector:
+    poll_interval_seconds: 5
+    signal_file_path: "config/signal_config.csv"
+
+# ==================== PHM系统配置 ====================
+phm:
+  server:
+    address: "http://127.0.0.1:18001"
+    username: "admin"
+    password: "phmpassword"
+  mqtt_client:
+    client_id: "python-collector-01"
+    username: "mqtt_user"
+    password: "mqtt_password"
+  mqtt_broker:
+    ip: "127.0.0.1"
+    port: 8001
+  data_collection:
+    save_path: 'E:\FinStab_Vib\test2'
+    # 定时采样配置
+    sampling_schedules:
+      - name: "high_freq_group"
+        channels: [ "1", "2" ]
+        sampling_rate: 25600
+        interval_minutes: 1
+        duration_seconds: 1
+        data_types: [ "waveform" ]
+        merge_channels: true
+
+      - name: "low_freq_group"
+        channels: [ "3", "4", "5" ]
+        sampling_rate: 12800
+        interval_minutes: 10
+        duration_seconds: 120
+        data_types: [ "waveform" ]
+        merge_channels: true
+
+# ==================== 振动数据配置 ====================
+vibration_data:
+  file_pattern: "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_*Hz.csv"
+  data_format: "multi_channel"
+
+  validation:
+    enable: false
+    min_data_points: 100
+    max_zero_ratio: 0.1
+    min_std_threshold: 0.001
+    max_std_threshold: 1000
+    valid_amplitude_range:
+      min: -100
+      max: 100
+    outlier_detection:
+      enable: true
+      method: "iqr"
+      threshold: 3.0
+    spike_detection:
+      enable: true
+      max_spike_ratio: 0.05
+
+  # single_value格式的列名配置
+  columns:
+    timestamp: "timestamp"
+    value: "value"
+
+  sampling_rates_by_channel:
+    ch1: 25600
+    ch2: 25600
+    ch3: 12800
+    ch4: 12800
+    ch5: 12800
+
+  filename_time_format: "%Y%m%d_%H%M%S_%f"
+  read_latest_only: true
+  max_file_age_hours: 24
+
+# ==================== 转速数据配置 ====================
+speed_data:
+  device_name: "gearbox_test"
+  point_name: "speed_test"
+  measurement: "signal_data"
+  data_type: "float"
+  unit: "RPM"
+  time_window_seconds: 10
+  alignment_tolerance_ms: 1000
+  sampling_rate: 1.0
+  time_buffer_seconds: 5
+  valid_range:
+    min: 0
+    max: 3000
+  interpolation_method: "cubic"
+
+  running_detection:
+    enable: false
+    min_running_speed: 100
+    speed_stability_window: 5
+    min_stable_speed_ratio: 0.8
+    allow_diagnosis_without_speed: true
+
+# ==================== 输出配置 ====================
+output:
+  algorithm_name: "towing_winch_monitor_v1"
+  algorithm_version: "1.0.0"
+  health_score_interval_minutes: 10
+  logging:
+    enable_logging: true
+    log_path: "./logs"
+    log_level: "INFO"
+    log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    max_log_size_mb: 100
+    backup_count: 5
+  data_output:
+    enable_csv_export: false
+    csv_export_path: "./output"
+    enable_json_export: false
+    json_export_path: "./output"
+
+# ==================== 心跳监控配置 ====================
+heartbeat:
+  enable_heartbeat: true
+  heartbeat_interval_seconds: 60
+  heartbeat_timeout_seconds: 180
+  services_to_monitor:
+    - name: "influxdb"
+      type: "database"
+      check_method: "ping"
+      timeout: 10
+
+    - name: "system_memory"
+      type: "system"
+      check_method: "memory_usage"
+      threshold: 85
+
+    - name: "data_disk"
+      type: "system"
+      check_method: "disk_usage"
+      path: "E:\\"
+      threshold: 90
+
+  failure_actions:
+    notification: true
+    restart_on_failure: false
+    max_restart_attempts: 3
+
+# ==================== 系统配置 ====================
+system:
+  mode: "production"
+  enable_data_collection: true
+  cycle_interval: 0.1  # 主循环间隔（秒），支持高频Modbus采集
+  performance:
+    max_workers: 4
+    memory_limit_mb: 1024
+    enable_multiprocessing: false
+  debug:
+    enable_debug_mode: false
+    save_intermediate_results: false
+    debug_output_path: "./debug"
+
+# ==================== 测试模式配置 ====================
+# 用于在没有真实数据源的环境中测试程序
+test_mode:
+  enabled: true  # true = 测试模式，false = 生产模式
+  
+  # 振动数据模拟配置
+  vibration_simulation:
+    enabled: true  # 是否模拟振动数据
+    channels: ["ch1", "ch2", "ch3", "ch4", "ch5"]
+    sampling_rates:
+      ch1: 25600
+      ch2: 25600
+      ch3: 25600
+      ch4: 25600
+      ch5: 25600
+    duration_seconds: 1  # 每次生成的数据时长
+    generation_interval: 60  # 数据生成间隔（秒）
+    # 信号参数
+    signal_params:
+      base_frequency: 50  # 基础频率（Hz）
+      amplitude: 1.0  # 振幅
+      noise_level: 0.1  # 噪声水平
+      health_score: 85  # 模拟健康度（影响信号质量）
+  
+ # Modbus数据模拟配置
+  modbus_simulation:
+    enabled: true  # 是否模拟Modbus数据
+    update_interval: 5  # 数据更新间隔（秒）
+    # 模拟信号列表（会覆盖signal_config.csv）
+    signals:
+      - device_name: "gearbox_test"
+        point_name: "speed_test"
+        data_type: "float32"
+        unit: "RPM"
+        interval: 0.2  # 采集间隔（5Hz）
+        value_range: [0, 40]
+      - device_name: "gearbox_test"
+        point_name: "temperature"
+        data_type: "float32"
+        unit: "°C"
+        interval: 1.0  # 采集间隔（1Hz）
+        value_range: [40, 60]
+      - device_name: "gearbox_test"
+        point_name: "pressure"
+        data_type: "float32"
+        unit: "bar"
+        interval: 1.0  # 采集间隔（1Hz）
+        value_range: [5, 8]
+
+# ==================== 转速触发配置 ====================
+speed_trigger:
+  enable: true                          # 是否启用转速触发
+  threshold_rpm: 5.0                    # 触发阈值（RPM）
+  cooldown_seconds: 0.1                 # 冷却时间（秒），防止频繁触发
+  check_interval_seconds: 0.1           # 检查间隔（秒）
+  device_name: "gearbox_test"           # 转速信号的设备名
+  point_name: "speed_test"              # 转速信号的测点名
+  
+  # 触发后的振动数据采集配置
+  vibration_acquisition:
+    duration_seconds: 2                 # 采集时长（秒）
+
+# ==================== 时区配置 ====================
+timezone: "Asia/Shanghai"
+timezone_handling:
+  database_stores_local_time: true
+
+# ==================== 智能诊断配置 ====================
+diagnosis_config:
+  # 1. 健康评估配置 
+  health_assessment:
+    base_score: 100.0
+    # 只有当健康分低于此阈值时，才触发具体的故障诊断逻辑
+    diagnosis_trigger_threshold: 85.0 
+    
+    # 启用的无量纲特征
+    enabled_features:
+      - "kurtosis"        # 峭度
+      - "margin_factor"   # 裕度因子
+      - "shape_factor"    # 波形因子
+      - "crest_factor"    # 峰值因子
+      - "impulse_factor"  # 脉冲因子
+      
+    # 特征权重 (总和建议为1.0，用于加权扣分)
+    feature_weights:
+      kurtosis: 0.3
+      margin_factor: 0.2
+      shape_factor: 0.1
+      crest_factor: 0.2
+      impulse_factor: 0.2
+    
+    # 健康映射参数 (Feature Value -> Health Deduction)
+    # 超过 limit 值将导致该项特征对应的权重分被完全扣除
+    limits:
+      kurtosis: 4.5
+      margin_factor: 6.0
+      shape_factor: 2.0
+      crest_factor: 5.0
+      impulse_factor: 6.0
+
+  # 2. 故障诊断配置
+  fault_diagnosis:
+    # 阶次谱分析分辨率
+    frequency_resolution: 0.1  # Hz
+    max_order: 20.0
+    
+    # 故障特征库
+    fault_library:
+      - name: "Unbalance"  # 不平衡
+        component: "motor"
+        target_order: 1.0  # 1X 转频
+        tolerance: 0.1     # 阶次容差
+        amplitude_threshold: 2.5 # 阶次幅值报警阈值 (m/s^2)
+        severity: "High"
+        
+      - name: "Misalignment" # 不对中
+        component: "coupling"
+        target_order: 2.0  # 2X 转频 (通常伴随1X)
+        tolerance: 0.1
+        amplitude_threshold: 1.5
+        severity: "Medium"
+        
+      - name: "Looseness" # 机械松动
+        component: "base"
+        target_order: 3.0  # 3X 及高次谐波
+        tolerance: 0.15
+        amplitude_threshold: 1.2
+        severity: "Medium"
+
+      # 轴承故障 (需根据实际轴承型号计算阶次)
+      # 假设 BPFO = 3.58 (外圈)
+      - name: "Bearing_Outer_Race"
+        component: "gearbox_input_bearing"
+        target_order: 3.58
+        tolerance: 0.05
+        amplitude_threshold: 0.8
+        severity: "High"
