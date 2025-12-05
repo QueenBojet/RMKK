@@ -1,0 +1,141 @@
+# ==================== 数据库配置 ====================
+database:
+  host: "localhost"
+  port: 8086
+  database: "industrial_data"
+  username: ""
+  password: ""
+  timeout: 30
+  timezone: "Asia/Shanghai"
+
+# ==================== Modbus配置 ====================
+modbus:
+  server:
+    host: "192.168.0.145"
+    port: 502
+  collector:
+    poll_interval_seconds: 5
+    signal_file_path: "config/signal_config.csv"
+
+# ==================== PHM系统配置 ====================
+phm:
+  server:
+    address: "http://127.0.0.1:18001"
+    username: "admin"
+    password: "phmpassword"
+  mqtt_client:
+    client_id: "python-collector-01"
+    username: "mqtt_user"
+    password: "mqtt_password"
+  mqtt_broker:
+    ip: "127.0.0.1"
+    port: 8001
+  data_collection:
+    save_path: 'E:\FinStab_Vib\test2'
+    # 定时采样配置
+    sampling_schedules:
+      - name: "winch"
+        channels: [ "1", "2", "3", "4", "5" ]
+        sampling_rate: 25600
+        interval_minutes: 1
+        duration_seconds: 1
+        data_types: [ "waveform" ]
+        merge_channels: true
+
+# ==================== 转速触发配置  ====================
+speed_trigger:
+  enable: true
+  device_name: "motor"          # 监听设备
+  point_name: "rotate_speed"    # 监听测点
+
+  threshold_rpm: 5.0            # 触发阈值
+  cooldown_seconds: 1.0         # 冷却时间
+
+  # 采集后验证：采集期间必须有80%的时间转速达标，否则视为无效数据丢弃
+  validation:
+    min_valid_ratio: 0.8
+
+# ==================== 振动数据配置 ====================
+vibration_data:
+  # 用于文件名生成的时间格式
+  filename_time_format: "%Y%m%d_%H%M%S"
+  # 采样率配置
+  sampling_rates_by_channel:
+    ch1: 25600
+    ch2: 25600
+    ch3: 25600
+    ch4: 25600
+    ch5: 25600
+
+# ==================== 智能诊断配置 ====================
+diagnosis_config:
+  health_assessment:
+    base_score: 100.0
+    diagnosis_trigger_threshold: 85.0
+    enabled_features: ["kurtosis", "margin_factor", "shape_factor", "crest_factor", "impulse_factor"]
+    feature_weights:
+      kurtosis: 0.3
+      margin_factor: 0.2
+      shape_factor: 0.1
+      crest_factor: 0.2
+      impulse_factor: 0.2
+    limits:
+      kurtosis: 4.5
+      margin_factor: 6.0
+      shape_factor: 2.0
+      crest_factor: 5.0
+      impulse_factor: 6.0
+
+  fault_diagnosis:
+    max_order: 20.0
+    fault_library:
+      - name: "Unbalance"
+        component: "motor"
+        target_order: 1.0
+        tolerance: 0.1
+        amplitude_threshold: 2.5
+        severity: "High"
+      - name: "Misalignment"
+        component: "coupling"
+        target_order: 2.0
+        tolerance: 0.1
+        amplitude_threshold: 1.5
+        severity: "Medium"
+      - name: "Bearing_Outer_Race"
+        component: "gearbox_input_bearing"
+        target_order: 3.58
+        tolerance: 0.05
+        amplitude_threshold: 0.8
+        severity: "High"
+
+# ==================== 输出与日志 ====================
+output:
+  logging:
+    enable_logging: true
+    log_path: "./logs"
+    log_level: "INFO"
+
+# ==================== 测试模式配置 ====================
+test_mode:
+  enabled: true
+
+  # 振动模拟：只有当转速达标时才会生成
+  vibration_simulation:
+    enabled: true
+    channels: ["ch1", "ch2", "ch3", "ch4", "ch5"]
+    sampling_rates:
+      ch1: 25600
+      ch2: 25600
+      ch3: 25600
+      ch4: 25600
+      ch5: 25600
+    duration_seconds: 1
+    signal_params:
+      base_frequency: 50
+      amplitude: 1.0
+      noise_level: 0.1
+
+  # Modbus模拟：读取CSV，每0.2秒(5Hz)更新一次
+  modbus_simulation:
+    enabled: true
+    update_interval: 0.2
