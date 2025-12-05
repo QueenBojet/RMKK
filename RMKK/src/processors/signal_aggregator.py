@@ -23,7 +23,11 @@ class SignalAggregator(Processor):
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        self._speed_history = deque(maxlen=1000)
+        # Speed history: (timestamp, value)
+        # Using deque is fine for simple history, but be aware of O(N) lookup. 
+        # For 1000 items it's acceptable.
+        self._speed_history = deque(maxlen=2000) 
+        
         self._vib_buffer: Dict[str, Dict[str, Any]] = defaultdict(dict)
         self._vib_metadata: Dict[str, Dict] = defaultdict(dict)
         self._buffer_lock = threading.Lock()
@@ -42,7 +46,7 @@ class SignalAggregator(Processor):
 
         self.speed_key = f"{self.trigger_cfg.device_name}.{self.trigger_cfg.point_name}"
 
-        self._current_speed = 0.0
+        # REMOVED: self._current_speed. It is evil. Don't use global state for async events.
         self._last_trigger_time = 0.0
 
         self.logger.info(f"Aggregator initialized. Watching: {self.speed_key} > {self.threshold} RPM.")
@@ -60,12 +64,14 @@ class SignalAggregator(Processor):
 
     def _process_loop(self):
         while self._running:
+            # Short timeout to keep loop responsive
             data = self.bus.get(timeout=0.1)
             if not data: continue
 
             try:
                 if data.type == DataType.SCALAR:
                     self._handle_scalar(data)
+                    # Forward scalar data to storage/others
                     self.bus.publish(data)
 
                 elif data.type == DataType.WAVEFORM:
@@ -77,35 +83,20 @@ class SignalAggregator(Processor):
 
     def _handle_scalar(self, data: DataPoint):
         key = f"{data.device_name}.{data.point_name}"
-
-        # --- DEBUG LOG FOR SPEED UPDATES ---
-        # This will confirm if Modbus is actually sending the right key
+        
+        # Only record the configured speed point
         if key == self.speed_key:
             val = float(data.value)
-            self._current_speed = val
             with self._buffer_lock:
                 self._speed_history.append((data.timestamp.timestamp(), val))
-            # Optional: Log occasionally to verify stream
-            # if val > 10 and int(time.time()) % 5 == 0:
-            #    self.logger.debug(f"Speed Update: {val:.1f} RPM")
-
-        elif "speed" in data.point_name.lower() and self._current_speed == 0.0:
-            self._current_speed = float(data.value)
 
     def _handle_waveform(self, data: DataPoint):
-        # 1. Trigger Check (Instantaneous)
-        if self._current_speed < self.threshold:
-            # --- EXPLICIT LOGGING FOR DROPS ---
-            # Now we log WARNING if we are getting vibration but speed says STOP.
-            # Only log for channel 1 to avoid spamming 5 times per event.
-            if "ch1" in data.point_name:
-                self.logger.warning(
-                    f"Ignored Vibration. Current Speed ({self._current_speed:.1f}) < Threshold ({self.threshold}). "
-                    f"Waiting for machine to speed up..."
-                )
-            return
-
-        # 2. Buffer Logic
+        # LINUS: I deleted the idiotic check "if current_speed < threshold" here.
+        # We process ALL waveform data into the buffer. 
+        # We decide whether to keep it later, based on its TIMESTAMP, not based on "now".
+        
+        # Group by timestamp (using seconds resolution string for key)
+        # Note: Ideally use exact timestamp if synchronized, but string key is safer for slight jitters
         ts_key = data.timestamp.strftime("%Y%m%d%H%M%S")
 
         with self._buffer_lock:
@@ -115,80 +106,76 @@ class SignalAggregator(Processor):
 
             self._vib_buffer[ts_key][data.point_name] = data.value
 
+            # Check if we have all required channels for this timestamp
             if self.required_channels.issubset(self._vib_buffer[ts_key].keys()):
                 self._process_complete_set(ts_key, data.timestamp)
 
     def _process_complete_set(self, ts_key: str, timestamp: datetime):
+        # Pop data from buffer
         data_map = self._vib_buffer.pop(ts_key)
         metadata = self._vib_metadata.pop(ts_key)
 
-        now = time.time()
-        if (now - self._last_trigger_time) < self.cooldown:
+        # 1. Check Signal Quality (RMS & Mean Abs > 1e-6)
+        # LINUS: This was missing in your code.
+        if not self._check_signal_quality(data_map):
+            self.logger.warning(f"Signal Quality Failed (RMS/Mean < 1e-6). Dropping set {ts_key}.")
             return
 
-        # --- VALIDATION ---
+        # 2. Extract Timing Info
         first_ch = list(data_map.values())[0]
         n_points = len(first_ch)
         fs = metadata.get('sampling_rate', 25600)
         duration = n_points / fs
-
+        
         start_ts = timestamp.timestamp()
         end_ts = start_ts + duration
 
-        # Look for history. Now that we backdated vibration timestamp,
-        # we should find plenty of Modbus data here.
-        history_slice = [
-            (t, v) for t, v in self._speed_history
-            if start_ts - 0.5 <= t <= end_ts + 0.5
-        ]
+        # 3. Speed Validation (The Truth Source)
+        # Retrieve speed data covering this time window [start_ts, end_ts]
+        # We add a small buffer (0.5s) to ensure interpolation works at edges
+        with self._buffer_lock:
+            history_slice = [
+                (t, v) for t, v in self._speed_history
+                if start_ts - 1.0 <= t <= end_ts + 1.0
+            ]
 
-        # Extract just the speeds for validation
-        speeds_val = [v for t, v in history_slice if start_ts <= t <= end_ts]
+        if not history_slice:
+            self.logger.warning(f"No speed data found for window {ts_key}. Dropping.")
+            return
 
-        if not speeds_val:
-            # Fallback (Should be rare now)
-            speeds_val = [self._current_speed]
+        # Extract values strictly within the acquisition window for validation
+        speeds_in_window = [v for t, v in history_slice if start_ts <= t <= end_ts]
+        
+        if not speeds_in_window:
+            # Fallback: if data points are sparse (e.g. 1Hz) and window is small
+            # use the nearest points from history_slice
+            speeds_in_window = [v for t, v in history_slice]
 
-        speeds_arr = np.array(speeds_val)
+        speeds_arr = np.array(speeds_in_window)
         valid_count = np.sum(speeds_arr > self.threshold)
         valid_ratio = valid_count / len(speeds_arr) if len(speeds_arr) > 0 else 0.0
         avg_speed = np.mean(speeds_arr)
 
-        # Log string for debug
-        speed_log_str = [round(x, 1) for x in speeds_arr.tolist()]
-        if len(speed_log_str) > 10:
-            speed_log_str = f"{speed_log_str[:5]} ... {speed_log_str[-5:]}"
-
+        # 4. Threshold Check
         if valid_ratio < self.min_valid_ratio:
-            self.logger.warning(
-                f"Speed Validation Failed ({valid_ratio:.0%}). "
-                f"Window: {speed_log_str}. Dropping data."
+            self.logger.debug(
+                f"Speed Validation Failed. Ratio: {valid_ratio:.2f} < {self.min_valid_ratio}. "
+                f"Avg Speed: {avg_speed:.1f}. Dropping."
             )
             return
 
+        # 5. Cooldown Check
+        # Only apply cooldown if we actually have a valid event
+        now = time.time()
+        if (now - self._last_trigger_time) < self.cooldown:
+            return
         self._last_trigger_time = now
 
-        # Interpolate
-        speed_upsampled = np.full(n_points, avg_speed)
-        if len(history_slice) > 1:
-            try:
-                t_x = np.array([x[0] for x in history_slice])
-                v_y = np.array([x[1] for x in history_slice])
-
-                # De-duplicate timestamps to avoid RuntimeWarning
-                _, unique_idx = np.unique(t_x, return_index=True)
-                t_x = t_x[unique_idx]
-                v_y = v_y[unique_idx]
-
-                if len(t_x) > 1:
-                    t_new = np.linspace(start_ts, end_ts, n_points)
-                    f = interp1d(t_x, v_y, kind='linear', fill_value="extrapolate")
-                    speed_upsampled = f(t_new)
-            except Exception as e:
-                self.logger.error(f"Interpolation error: {e}")
-
+        # 6. Interpolate Speed for Resampling
+        speed_upsampled = self._interpolate_speed(history_slice, start_ts, end_ts, n_points, avg_speed)
         data_map['speed'] = speed_upsampled
 
+        # 7. Publish
         dp = DataPoint(
             timestamp=timestamp,
             source=SignalSource.INTERNAL,
@@ -201,6 +188,48 @@ class SignalAggregator(Processor):
 
         self.logger.info(
             f"Triggered & Validated ({valid_ratio:.0%}). "
-            f"Avg: {avg_speed:.1f} RPM. Window: {speed_log_str}"
+            f"Avg: {avg_speed:.1f} RPM. Window: {ts_key}"
         )
         self.bus.publish(dp)
+
+    def _check_signal_quality(self, data_map: Dict[str, Any]) -> bool:
+        """
+        Verify that ALL vibration channels have:
+        1. RMS > 1e-6
+        2. Mean(Abs) > 1e-6
+        """
+        limit = 1e-6
+        for ch_name, signal in data_map.items():
+            if ch_name == 'speed': continue # Skip speed if present
+            
+            arr = np.array(signal)
+            rms = np.sqrt(np.mean(arr**2))
+            mean_abs = np.mean(np.abs(arr))
+            
+            if rms <= limit or mean_abs <= limit:
+                # self.logger.debug(f"Channel {ch_name} too weak. RMS:{rms:.2e}, MeanAbs:{mean_abs:.2e}")
+                return False
+        return True
+
+    def _interpolate_speed(self, history, start_ts, end_ts, n_points, default_val):
+        try:
+            t_x = np.array([x[0] for x in history])
+            v_y = np.array([x[1] for x in history])
+
+            # Sort and de-duplicate (time can flow backwards in bad mocks, fix it)
+            sorted_indices = np.argsort(t_x)
+            t_x = t_x[sorted_indices]
+            v_y = v_y[sorted_indices]
+
+            _, unique_idx = np.unique(t_x, return_index=True)
+            t_x = t_x[unique_idx]
+            v_y = v_y[unique_idx]
+
+            if len(t_x) > 1:
+                t_new = np.linspace(start_ts, end_ts, n_points)
+                f = interp1d(t_x, v_y, kind='linear', fill_value="extrapolate")
+                return f(t_new)
+        except Exception as e:
+            self.logger.error(f"Interpolation error: {e}")
+        
+        return np.full(n_points, default_val)
