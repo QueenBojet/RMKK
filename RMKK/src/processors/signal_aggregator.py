@@ -24,8 +24,7 @@ class SignalAggregator(Processor):
         self._thread: Optional[threading.Thread] = None
 
         # Speed history: (timestamp, value)
-        # Using deque is fine for simple history, but be aware of O(N) lookup. 
-        # For 1000 items it's acceptable.
+        # Using deque for O(1) appends. Maxlen 2000 is enough for minutes of 5Hz data.
         self._speed_history = deque(maxlen=2000) 
         
         self._vib_buffer: Dict[str, Dict[str, Any]] = defaultdict(dict)
@@ -45,8 +44,6 @@ class SignalAggregator(Processor):
                 self.min_valid_ratio = val_cfg.min_valid_ratio
 
         self.speed_key = f"{self.trigger_cfg.device_name}.{self.trigger_cfg.point_name}"
-
-        # REMOVED: self._current_speed. It is evil. Don't use global state for async events.
         self._last_trigger_time = 0.0
 
         self.logger.info(f"Aggregator initialized. Watching: {self.speed_key} > {self.threshold} RPM.")
@@ -71,8 +68,9 @@ class SignalAggregator(Processor):
             try:
                 if data.type == DataType.SCALAR:
                     self._handle_scalar(data)
-                    # Forward scalar data to storage/others
-                    self.bus.publish(data)
+                    # CRITICAL FIX: DO NOT RE-PUBLISH SCALAR DATA HERE!
+                    # The raw scalar data is already on the bus for other consumers (Storage, etc.)
+                    # Re-publishing it causes an infinite loop where Aggregator consumes its own echo.
 
                 elif data.type == DataType.WAVEFORM:
                     self._handle_waveform(data)
@@ -84,19 +82,16 @@ class SignalAggregator(Processor):
     def _handle_scalar(self, data: DataPoint):
         key = f"{data.device_name}.{data.point_name}"
         
-        # Only record the configured speed point
+        # Only record the configured speed point into history
         if key == self.speed_key:
             val = float(data.value)
             with self._buffer_lock:
                 self._speed_history.append((data.timestamp.timestamp(), val))
 
     def _handle_waveform(self, data: DataPoint):
-        # LINUS: I deleted the idiotic check "if current_speed < threshold" here.
-        # We process ALL waveform data into the buffer. 
-        # We decide whether to keep it later, based on its TIMESTAMP, not based on "now".
+        # LINUS: We do NOT check current_speed here. We buffer everything and validate later.
         
-        # Group by timestamp (using seconds resolution string for key)
-        # Note: Ideally use exact timestamp if synchronized, but string key is safer for slight jitters
+        # Group by timestamp (using seconds resolution string for key to handle slight jitter)
         ts_key = data.timestamp.strftime("%Y%m%d%H%M%S")
 
         with self._buffer_lock:
@@ -116,9 +111,8 @@ class SignalAggregator(Processor):
         metadata = self._vib_metadata.pop(ts_key)
 
         # 1. Check Signal Quality (RMS & Mean Abs > 1e-6)
-        # LINUS: This was missing in your code.
         if not self._check_signal_quality(data_map):
-            self.logger.warning(f"Signal Quality Failed (RMS/Mean < 1e-6). Dropping set {ts_key}.")
+            self.logger.warning(f"Validation Failed: Signal Quality too low (RMS/Mean < 1e-6). Dropping set {ts_key}.")
             return
 
         # 2. Extract Timing Info
@@ -130,9 +124,9 @@ class SignalAggregator(Processor):
         start_ts = timestamp.timestamp()
         end_ts = start_ts + duration
 
-        # 3. Speed Validation (The Truth Source)
+        # 3. Speed Validation (History Check)
         # Retrieve speed data covering this time window [start_ts, end_ts]
-        # We add a small buffer (0.5s) to ensure interpolation works at edges
+        # We add a small buffer (1.0s) to ensure interpolation works at edges
         with self._buffer_lock:
             history_slice = [
                 (t, v) for t, v in self._speed_history
@@ -140,15 +134,16 @@ class SignalAggregator(Processor):
             ]
 
         if not history_slice:
-            self.logger.warning(f"No speed data found for window {ts_key}. Dropping.")
+            # If we have NO history, we can't validate.
+            # This happens if Modbus is dead or Aggregator just started.
+            self.logger.warning(f"Validation Failed: No speed history found for window {ts_key}. Modbus active?")
             return
 
         # Extract values strictly within the acquisition window for validation
         speeds_in_window = [v for t, v in history_slice if start_ts <= t <= end_ts]
         
         if not speeds_in_window:
-            # Fallback: if data points are sparse (e.g. 1Hz) and window is small
-            # use the nearest points from history_slice
+            # Fallback: if data points are sparse (e.g. 1Hz) and window is small, use nearby points
             speeds_in_window = [v for t, v in history_slice]
 
         speeds_arr = np.array(speeds_in_window)
@@ -158,14 +153,13 @@ class SignalAggregator(Processor):
 
         # 4. Threshold Check
         if valid_ratio < self.min_valid_ratio:
-            self.logger.debug(
-                f"Speed Validation Failed. Ratio: {valid_ratio:.2f} < {self.min_valid_ratio}. "
-                f"Avg Speed: {avg_speed:.1f}. Dropping."
+            self.logger.warning(
+                f"Validation Failed: Speed Ratio {valid_ratio:.0%} < {self.min_valid_ratio:.0%}. "
+                f"Avg Speed: {avg_speed:.1f} RPM. Dropping."
             )
             return
 
         # 5. Cooldown Check
-        # Only apply cooldown if we actually have a valid event
         now = time.time()
         if (now - self._last_trigger_time) < self.cooldown:
             return
@@ -175,7 +169,7 @@ class SignalAggregator(Processor):
         speed_upsampled = self._interpolate_speed(history_slice, start_ts, end_ts, n_points, avg_speed)
         data_map['speed'] = speed_upsampled
 
-        # 7. Publish
+        # 7. Publish Aggregated Data
         dp = DataPoint(
             timestamp=timestamp,
             source=SignalSource.INTERNAL,
@@ -188,7 +182,7 @@ class SignalAggregator(Processor):
 
         self.logger.info(
             f"Triggered & Validated ({valid_ratio:.0%}). "
-            f"Avg: {avg_speed:.1f} RPM. Window: {ts_key}"
+            f"Avg: {avg_speed:.1f} RPM. Window: {ts_key}. Sending to Diagnosis."
         )
         self.bus.publish(dp)
 
@@ -200,14 +194,14 @@ class SignalAggregator(Processor):
         """
         limit = 1e-6
         for ch_name, signal in data_map.items():
-            if ch_name == 'speed': continue # Skip speed if present
+            if ch_name == 'speed': continue 
             
             arr = np.array(signal)
             rms = np.sqrt(np.mean(arr**2))
             mean_abs = np.mean(np.abs(arr))
             
             if rms <= limit or mean_abs <= limit:
-                # self.logger.debug(f"Channel {ch_name} too weak. RMS:{rms:.2e}, MeanAbs:{mean_abs:.2e}")
+                # Log detail for debug if needed, but return False is enough
                 return False
         return True
 
@@ -216,7 +210,7 @@ class SignalAggregator(Processor):
             t_x = np.array([x[0] for x in history])
             v_y = np.array([x[1] for x in history])
 
-            # Sort and de-duplicate (time can flow backwards in bad mocks, fix it)
+            # Sort and de-duplicate (timestamp jitter protection)
             sorted_indices = np.argsort(t_x)
             t_x = t_x[sorted_indices]
             v_y = v_y[sorted_indices]
